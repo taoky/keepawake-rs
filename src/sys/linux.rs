@@ -7,11 +7,28 @@
 //! [`org.freedesktop.ScreenSaver`]: https://people.freedesktop.org/~hadess/idle-inhibition-spec/re01.html
 //! [systemd Inhibitor Locks]: https://www.freedesktop.org/wiki/Software/systemd/inhibit/
 
+use std::collections::HashMap;
+
+use rand::Rng;
 use zbus::{blocking::Connection, proxy};
 
 use crate::Options;
 
 pub type Error = zbus::Error;
+
+#[proxy(
+    interface = "org.freedesktop.portal.Inhibit",
+    default_service = "org.freedesktop.portal.Desktop",
+    default_path = "/org/freedesktop/portal/desktop"
+)]
+trait PortalInhibit {
+    fn inhibit(
+        &self,
+        window: &str,
+        flags: u32,
+        options: HashMap<&str, &zbus::zvariant::Value<'_>>,
+    ) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+}
 
 #[proxy(
     interface = "org.freedesktop.login1.Manager",
@@ -44,6 +61,7 @@ pub struct KeepAwake {
     session_conn: Option<Connection>,
     screensaver_proxy: Option<ScreenSaverProxyBlocking<'static>>,
     cookie: Option<u32>,
+    portal_proxy: Option<PortalInhibitProxyBlocking<'static>>,
 
     system_conn: Option<Connection>,
     manager_proxy: Option<ManagerProxyBlocking<'static>>,
@@ -58,6 +76,7 @@ impl KeepAwake {
 
             session_conn: None,
             screensaver_proxy: None,
+            portal_proxy: None,
             cookie: None,
 
             system_conn: None,
@@ -69,7 +88,51 @@ impl KeepAwake {
         Ok(awake)
     }
 
+    fn in_sandbox(&self) -> bool {
+        // for now, just check if /.flatpak-info exists
+        std::path::Path::new("/.flatpak-info").exists()
+    }
+
     fn set(&mut self) -> Result<(), zbus::Error> {
+        if self.in_sandbox() {
+            self.session_conn = Some(Connection::session()?);
+            self.portal_proxy = Some(PortalInhibitProxyBlocking::new(
+                self.session_conn.as_ref().unwrap(),
+            )?);
+
+            let mut flags: u32 = 0;
+            if self.options.display || self.options.idle {
+                flags |= 8; // Idle
+            }
+            if self.options.sleep {
+                flags |= 4; // Suspend
+            }
+
+            let mut rng = rand::rng();
+            let token: String = (&mut rng)
+                .sample_iter(rand::distr::Alphanumeric)
+                .take(10)
+                .map(char::from)
+                .collect();
+            let token = format!("keepawake_rs_{}", token);
+
+            let handle_token = zbus::zvariant::Value::from(token.as_str());
+            let reason = zbus::zvariant::Value::from(self.options.reason.as_str());
+
+            let options = HashMap::from([("reason", &reason), ("handle_token", &handle_token)]);
+
+            let _ = self
+                .portal_proxy
+                .as_ref()
+                .unwrap()
+                .inhibit("", flags, options)?;
+            Ok(())
+        } else {
+            self.set_traditional()
+        }
+    }
+
+    fn set_traditional(&mut self) -> Result<(), zbus::Error> {
         self.cookie = if self.options.display {
             self.session_conn = Some(Connection::session()?);
             self.screensaver_proxy = Some(ScreenSaverProxyBlocking::new(
